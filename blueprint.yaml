@@ -1,0 +1,202 @@
+tosca_definitions_version: cloudify_dsl_1_3
+
+description: >
+  See README.md file.
+
+imports:
+  - http://cloudify.co/spec/cloudify/5.0.0/types.yaml
+  - plugin:cloudify-terraform-plugin
+  - plugin:demo-plugin
+
+inputs:
+  aws_access_key_id:
+    description: >
+      Access key ID for AWS.
+    type: string
+    default: { get_secret: aws_default_access_key_id }
+
+  aws_secret_access_key:
+    description: >
+      Secret access key for AWS.
+    type: string
+    default: { get_secret: aws_default_secret_access_key }
+
+  ec2_region_name:
+    description: >
+      AWS region to operate in.
+    type: string
+    default: { get_secret: aws_default_ec2_region_name }
+
+  vpc_id:
+    description: >
+      AWS ID of a pre-existing VPC to connect to.
+    type: string
+    default: { get_secret: aws_default_vpc_id }
+
+  terraform_executable:
+    description: >
+      Path to the Terraform executable.
+    type: string
+    default: /usr/bin/terraform
+
+  subnet_cidr:
+    description: >
+      CIDR mask of the new subnet to create.
+    type: string
+
+  keypair_name:
+    description: >
+      Name of keypair to associate new VM with.
+    type: string
+    default: { get_secret: aws_default_keypair_name }
+
+  agent_user:
+    description: >
+      User ID to use when installing the agent.
+    type: string
+    default: { get_secret: default_linux_agent_user }
+
+  agents_security_group_id:
+    description: >
+      AWS ID of the agents security group.
+    default: { get_secret: aws_default_agents_security_group_id }
+
+  private_key_path:
+    description: >
+      Path, on Cloudify Manager, for the private key used to SSH
+      to the VM for the purpose of installing the agent.
+    type: string
+    default: { get_secret: default_private_key_path }
+
+  content_dir:
+    description: >
+      Directory to serve contents from.
+    type: string
+    default: /var/wwwroot
+
+  ftp_username:
+    description: >
+      Name of user to create for FTP access.
+    type: string
+    default: test
+
+  min_ftp_port:
+    description: >
+      Lowest port number to use for FTP PASV mode.
+    type: integer
+    default: 10000
+
+  max_ftp_port:
+    description: >
+      Highest  port number to use for FTP PASV mode.
+    type: integer
+    default: 10100
+
+node_templates:
+  cloud_resources:
+    type: cloudify.nodes.terraform.Module
+    properties:
+      executable_path: { get_input: terraform_executable }
+      plugins_dir: { get_secret: terraform_plugins_dir }
+      storage_path: { get_secret: terraform_storage_path }
+      resource_config:
+        environment_variables:
+          AWS_ACCESS_KEY_ID: { get_input: aws_access_key_id }
+          AWS_SECRET_ACCESS_KEY: { get_input: aws_secret_access_key }
+          AWS_DEFAULT_REGION: { get_input: ec2_region_name }
+        variables:
+          aws_region: { get_input: ec2_region_name }
+          keypair_name: { get_input: keypair_name }
+          vpc_id: { get_input: vpc_id }
+          admin_user: { get_input: agent_user }
+          subnet_cidr: { get_input: subnet_cidr }
+          agents_security_group_id: { get_input: agents_security_group_id }
+          min_ftp_port: { get_input: min_ftp_port }
+          max_ftp_port: { get_input: max_ftp_port }
+        source: resources/template.zip
+
+  vm:
+    type: cloudify.nodes.Compute
+    properties:
+      ip: { get_attribute: [ cloud_resources, resources, web, instances, 0, attributes, private_ip ] }
+      agent_config:
+        install_method: remote
+        user: { get_input: agent_user }
+        key: { get_input: private_key_path }
+      os_family: linux
+    relationships:
+      - target: cloud_resources
+        type: cloudify.relationships.depends_on
+
+  vm_init:
+    type: cloudify.nodes.Root
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          implementation: scripts/init.sh
+          inputs:
+            ftp_username: { get_input: ftp_username }
+            content_dir: { get_input: content_dir }
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: vm
+
+  ftp_server:
+    type: vsftpd
+    properties:
+      configuration:
+        anonymous_enable: NO
+        local_enable: YES
+        write_enable: YES
+        local_umask: 022
+        connect_from_port_20: YES
+        ascii_upload_enable: YES
+        ascii_download_enable: YES
+        ftpd_banner: Welcome
+        listen: NO
+        listen_ipv6: YES
+        pam_service_name: vsftpd
+        userlist_enable: YES
+        tcp_wrappers: YES
+        use_localtime: YES
+        pasv_enable: Yes
+        pasv_min_port: { get_input: min_ftp_port }
+        pasv_max_port: { get_input: max_ftp_port }
+        local_root: { get_property: [ http_server, content_dir ] }
+        pasv_promiscuous: YES
+    relationships:
+      - target: vm
+        type: cloudify.relationships.contained_in
+      - target: vm_init
+        type: cloudify.relationships.depends_on
+
+  nodejs:
+    type: nodejs
+    properties:
+      npm_list:
+        - http-server
+    relationships:
+      - target: vm
+        type: cloudify.relationships.contained_in
+      - target: vm_init
+        type: cloudify.relationships.depends_on
+
+  http_server:
+    type: nodejs.http_server
+    properties:
+      content_dir: /var/wwwroot
+    relationships:
+      - target: vm
+        type: cloudify.relationships.contained_in
+      - target: nodejs
+        type: cloudify.relationships.depends_on
+
+capabilities:
+  username:
+    value: { get_input: ftp_username }
+  password:
+    value: { get_attribute: [ vm_init, ftp_password ] }
+  endpoint:
+    value: { concat: [ 'ftp://', { get_attribute: [ cloud_resources, resources, eip, instances, 0, attributes, public_ip ] } ] }
+  base_url:
+    value: { concat: [ 'http://', { get_attribute: [ cloud_resources, resources, eip, instances, 0, attributes, public_ip ] }, ':', { get_property: [ http_server, port ] } ] }
